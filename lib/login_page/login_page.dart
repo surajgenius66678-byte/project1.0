@@ -21,36 +21,51 @@ class _LoginPageState extends State<LoginPage> {
   }
 
   Future<void> _initializeVoiceManager() async {
-    voiceManager = VoiceManager();
-    
+  voiceManager = VoiceManager();
+
+  try {
     // Initialize voice manager
-    bool initialized = await voiceManager.initialize();
-    
-    if (initialized) {
-      // Set up callbacks
-      voiceManager.setCallbacks(
-        onResult: _handleVoiceResult,
-        onError: _handleVoiceError,
-        onListeningStateChange: (isListening) {
-          // Update UI if needed
-          if (!isListening) {
-            // Listening stopped
-          }
-        },
-      );
-      
-      // Play greeting and start quiet listening for wake word
-      await voiceManager.speakGreeting("User");
-      
-    } else {
+    final initialized = await voiceManager.initialize();
+
+    if (!initialized) {
+      if (!mounted) return;
+
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text("Voice assistant initialization failed"),
           backgroundColor: Colors.red,
         ),
       );
+
+      return;
     }
+
+    // Set up callbacks
+    voiceManager.setCallbacks(
+      onResult: _handleVoiceResult,
+      onError: _handleVoiceError,
+      onListeningStateChange: (isListening) {
+        // Update UI if needed
+      },
+    );
+
+    // Greeting
+    await voiceManager.speakGreeting("User");
+
+    // IMPORTANT:
+    // Start the actual ONNX Hey Horus wake-word listener.
+    await voiceManager.startQuietListeningForWakeWord();
+  } catch (e) {
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text("Voice setup error: $e"),
+        backgroundColor: Colors.red,
+      ),
+    );
   }
+}
 
   void _handleVoiceResult(String result) {
     // Handle different voice results

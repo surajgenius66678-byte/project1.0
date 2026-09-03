@@ -1,5 +1,10 @@
+import 'dart:async';
+import 'dart:typed_data';
+
 import 'package:flutter_tts/flutter_tts.dart';
+import 'package:open_wake_word/open_wake_word.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:record/record.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 
 typedef OnResultCallback = Function(String recognizedText);
@@ -9,8 +14,30 @@ typedef OnListeningStateChange = Function(bool isListening);
 class VoiceManager {
   static final VoiceManager _instance = VoiceManager._internal();
 
+  // ============================================================
+  // EXISTING VOICE COMPONENTS
+  // ============================================================
+
   late stt.SpeechToText _speechToText;
   late FlutterTts _flutterTts;
+
+  // ============================================================
+  // WAKE WORD COMPONENTS
+  // ============================================================
+
+  final AudioRecorder _audioRecorder = AudioRecorder();
+
+  StreamSubscription<Uint8List>? _wakeWordAudioSubscription;
+
+  bool _wakeWordInitialized = false;
+  bool _wakeWordListening = false;
+
+  // Prevent multiple detections while transitioning
+  bool _wakeWordHandling = false;
+
+  // ============================================================
+  // GENERAL STATE
+  // ============================================================
 
   bool _isInitialized = false;
   bool _isListening = false;
@@ -20,26 +47,54 @@ class VoiceManager {
   OnErrorCallback? _onError;
   OnListeningStateChange? _onListeningStateChange;
 
+  // ============================================================
+  // SINGLETON
+  // ============================================================
+
   factory VoiceManager() {
     return _instance;
   }
 
   VoiceManager._internal();
 
-  // Getters
+  // ============================================================
+  // GETTERS
+  // ============================================================
+
   bool get isInitialized => _isInitialized;
   bool get isListening => _isListening;
+  bool get isWakeWordListening => _wakeWordListening;
   String get recognizedText => _recognizedText;
 
-  /// Initialize VoiceManager - call this on app startup
+  // ============================================================
+  // INITIALIZATION
+  // ============================================================
+
+  /// Initialize VoiceManager.
+  ///
+  /// This initializes:
+  /// - Speech-to-text
+  /// - Text-to-speech
+  /// - Microphone permission
+  /// - Hey Horus wake-word engine
   Future<bool> initialize() async {
     try {
-      if (_isInitialized) return true;
+      if (_isInitialized) {
+        return true;
+      }
+
+      // ----------------------------------------------------------
+      // Speech-to-text
+      // ----------------------------------------------------------
 
       _speechToText = stt.SpeechToText();
+
+      // ----------------------------------------------------------
+      // Text-to-speech
+      // ----------------------------------------------------------
+
       _flutterTts = FlutterTts();
 
-      // Initialize speech_to_text
       bool available = await _speechToText.initialize(
         onError: (error) {
           _handleError('Speech error: $error');
@@ -54,19 +109,34 @@ class VoiceManager {
         return false;
       }
 
-      // Initialize TTS
       await _flutterTts.setLanguage("en-US");
       await _flutterTts.setPitch(1.0);
       await _flutterTts.setSpeechRate(0.5);
 
-      // Request microphone permission
+      // ----------------------------------------------------------
+      // Microphone permission
+      // ----------------------------------------------------------
+
       final status = await Permission.microphone.request();
+
       if (!status.isGranted) {
         _handleError('Microphone permission denied');
         return false;
       }
 
+      // ----------------------------------------------------------
+      // Hey Horus wake-word engine
+      // ----------------------------------------------------------
+
+      final wakeWordReady = await initializeWakeWord();
+
+      if (!wakeWordReady) {
+        _handleError('Hey Horus wake-word engine initialization failed');
+        return false;
+      }
+
       _isInitialized = true;
+
       return true;
     } catch (e) {
       _handleError('Initialization error: $e');
@@ -74,7 +144,42 @@ class VoiceManager {
     }
   }
 
-  /// Set callbacks for voice events
+  // ============================================================
+  // WAKE WORD INITIALIZATION
+  // ============================================================
+
+  /// Initialize the OpenWakeWord engine.
+  Future<bool> initializeWakeWord() async {
+    try {
+      if (_wakeWordInitialized) {
+        return true;
+      }
+
+      final success = await OpenWakeWord.init(
+        melModelAssetPath: 'assets/models/melspectrogram.onnx',
+        embModelAssetPath: 'assets/models/embedding_model.onnx',
+        wwModelAssetPaths: [
+          'assets/models/hey_horus.onnx',
+        ],
+      );
+
+      _wakeWordInitialized = success;
+
+      if (!success) {
+        _handleError('Could not initialize Hey Horus model');
+      }
+
+      return success;
+    } catch (e) {
+      _handleError('Wake-word initialization error: $e');
+      return false;
+    }
+  }
+
+  // ============================================================
+  // CALLBACKS
+  // ============================================================
+
   void setCallbacks({
     OnResultCallback? onResult,
     OnErrorCallback? onError,
@@ -85,17 +190,41 @@ class VoiceManager {
     _onListeningStateChange = onListeningStateChange;
   }
 
-  /// Speak greeting on app open
+  // ============================================================
+  // TTS
+  // ============================================================
+
+  /// Speak greeting on app open.
   Future<void> speakGreeting(String userName) async {
     try {
-      String greeting = "Namaste! $userName";
+      final greeting = "Namaste! $userName";
       await _flutterTts.speak(greeting);
     } catch (e) {
       _handleError('TTS error: $e');
     }
   }
 
-  /// Start quiet listening for wake word (background, no notifications)
+  /// Speak arbitrary text.
+  Future<void> speak(String text) async {
+    try {
+      await _flutterTts.speak(text);
+    } catch (e) {
+      _handleError('TTS error: $e');
+    }
+  }
+
+  // ============================================================
+  // WAKE WORD LISTENING
+  // ============================================================
+
+  /// Start continuous Hey Horus detection.
+  ///
+  /// Microphone:
+  /// 16 kHz
+  /// Mono
+  /// PCM16
+  ///
+  /// Audio is continuously passed to OpenWakeWord.
   Future<void> startQuietListeningForWakeWord() async {
     if (!_isInitialized) {
       _handleError('VoiceManager not initialized');
@@ -103,30 +232,182 @@ class VoiceManager {
     }
 
     try {
-      _isListening = true;
-      _recognizedText = '';
+      if (_wakeWordListening) {
+        return;
+      }
 
-      // Listen continuously with longer timeout - quiet mode
-      await _speechToText.listen(
-        onResult: _handleWakeWordResult,
-        listenFor: const Duration(seconds: 30),
-        pauseFor: const Duration(seconds: 1),
-        localeId: 'en_US',
+      if (!await _audioRecorder.hasPermission()) {
+        _handleError('Microphone permission denied');
+        return;
+      }
+
+      if (!await initializeWakeWord()) {
+        return;
+      }
+
+      final stream = await _audioRecorder.startStream(
+        const RecordConfig(
+          encoder: AudioEncoder.pcm16bits,
+          sampleRate: 16000,
+          numChannels: 1,
+        ),
+      );
+
+      _wakeWordListening = true;
+      _wakeWordHandling = false;
+
+      _wakeWordAudioSubscription = stream.listen(
+        (Uint8List bytes) {
+          if (!_wakeWordListening || _wakeWordHandling) {
+            return;
+          }
+
+          try {
+            // record provides PCM16 bytes.
+            // OpenWakeWord expects Int16List.
+            final int16Audio = _bytesToInt16(bytes);
+
+            if (int16Audio.isEmpty) {
+              return;
+            }
+
+            OpenWakeWord.processAudio(int16Audio);
+
+            final probability = OpenWakeWord.getProbability();
+
+            // Useful while testing.
+            print(
+              'Hey Horus probability: '
+              '${probability.toStringAsFixed(4)}',
+            );
+
+            if (OpenWakeWord.isActivated()) {
+              _handleWakeWordDetected(probability);
+            }
+          } catch (e) {
+            _handleError('Wake-word processing error: $e');
+          }
+        },
+        onError: (error) {
+          _handleError(
+            'Wake-word audio stream error: $error',
+          );
+
+          _stopWakeWordEngine();
+        },
+        cancelOnError: false,
       );
     } catch (e) {
-      _handleError('Wake word listening error: $e');
-      _isListening = false;
-      // Restart quiet listening automatically on error
-      
+      _handleError('Wake-word listening error: $e');
+      await _stopWakeWordEngine();
     }
   }
 
-  /// Start listening for wake word (legacy - maps to quiet listening)
+  // ============================================================
+  // PCM16 CONVERSION
+  // ============================================================
+
+  /// Convert little-endian PCM16 bytes to Int16List.
+  Int16List _bytesToInt16(Uint8List bytes) {
+    final sampleCount = bytes.length ~/ 2;
+
+    final result = Int16List(sampleCount);
+
+    for (int i = 0; i < sampleCount; i++) {
+      final low = bytes[i * 2];
+      final high = bytes[i * 2 + 1];
+
+      int value = low | (high << 8);
+
+      // Convert unsigned 16-bit representation
+      // into signed 16-bit PCM.
+      if (value >= 0x8000) {
+        value -= 0x10000;
+      }
+
+      result[i] = value;
+    }
+
+    return result;
+  }
+
+  // ============================================================
+  // WAKE WORD DETECTED
+  // ============================================================
+
+  Future<void> _handleWakeWordDetected(double probability) async {
+  if (_wakeWordHandling) {
+    return;
+  }
+
+  _wakeWordHandling = true;
+
+  print(
+    'HEY HORUS DETECTED! '
+    'score=${probability.toStringAsFixed(4)}',
+  );
+
+  try {
+    // Stop wake-word listening first
+    await _stopWakeWordEngine();
+
+    // Tell the app that the wake word was detected
+    _onResult?.call('wake_word_detected');
+
+    // Say hello
+    await _flutterTts.speak("Hello");
+
+    // Give TTS/microphone a moment to transition
+    await Future.delayed(
+      const Duration(milliseconds: 700),
+    );
+
+    // Start listening for the user's command
+    await startListeningForCommand();
+  } catch (e) {
+    _handleError(
+      'Wake-word activation error: $e',
+    );
+  } finally {
+    _wakeWordHandling = false;
+  }
+}
+
+  // ============================================================
+  // STOP WAKE WORD ENGINE
+  // ============================================================
+
+  Future<void> _stopWakeWordEngine() async {
+    try {
+      await _wakeWordAudioSubscription?.cancel();
+      _wakeWordAudioSubscription = null;
+
+      if (_wakeWordListening) {
+        await _audioRecorder.stop();
+      }
+
+      _wakeWordListening = false;
+    } catch (e) {
+      _handleError(
+        'Stop wake-word engine error: $e',
+      );
+    }
+  }
+
+  // ============================================================
+  // LEGACY METHOD
+  // ============================================================
+
+  /// Kept for compatibility with existing code.
   Future<void> startListeningForWakeWord() async {
     await startQuietListeningForWakeWord();
   }
 
-  /// Start active listening for command (after wake word detected)
+  // ============================================================
+  // COMMAND LISTENING
+  // ============================================================
+
+  /// Start active speech recognition after Hey Horus is detected.
   Future<void> startListeningForCommand() async {
     if (!_isInitialized) {
       _handleError('VoiceManager not initialized');
@@ -135,15 +416,20 @@ class VoiceManager {
 
     try {
       _isListening = true;
-      _onListeningStateChange?.call(true); // Notify UI that actively listening
       _recognizedText = '';
 
-      // Speak prompt for command
-      await _flutterTts.speak("What would you like to do?");
+      _onListeningStateChange?.call(true);
 
-      await Future.delayed(const Duration(milliseconds: 500));
+      // Prompt the user.
+      await _flutterTts.speak(
+        "What would you like to do?",
+      );
 
-      // Listen for command
+      await Future.delayed(
+        const Duration(milliseconds: 500),
+      );
+
+      // Start command recognition.
       await _speechToText.listen(
         onResult: _handleCommandResult,
         listenFor: const Duration(seconds: 15),
@@ -151,142 +437,176 @@ class VoiceManager {
         localeId: 'en_US',
       );
     } catch (e) {
-      _handleError('Command listening error: $e');
+      _handleError(
+        'Command listening error: $e',
+      );
+
       _isListening = false;
       _onListeningStateChange?.call(false);
-      // Fallback to quiet listening
-      Future.delayed(const Duration(milliseconds: 500), () {
-        startQuietListeningForWakeWord();
-      });
+
+      await Future.delayed(
+        const Duration(milliseconds: 500),
+      );
+
+      // Return to wake-word listening.
+      await startQuietListeningForWakeWord();
     }
   }
 
-  /// Stop listening
+  // ============================================================
+  // STOP LISTENING
+  // ============================================================
+
   Future<void> stopListening() async {
     try {
       await _speechToText.stop();
+
+      await _stopWakeWordEngine();
+
       _isListening = false;
+
       _onListeningStateChange?.call(false);
     } catch (e) {
-      _handleError('Stop listening error: $e');
+      _handleError(
+        'Stop listening error: $e',
+      );
     }
   }
 
-  /// Handle wake word recognition result
-  void _handleWakeWordResult(result) {
-    _recognizedText = result.recognizedWords.toLowerCase();
+  // ============================================================
+  // COMMAND RESULT
+  // ============================================================
 
-    if (result.finalResult) {
-      if (_isWakeWordDetected(_recognizedText)) {
-        // Wake word detected! Go into active listening mode
-        stopListening();
-        _onResult?.call('wake_word_detected');
-        // Start active listening for command with sound/feedback
-        Future.delayed(const Duration(milliseconds: 500), () {
-          startListeningForCommand();
-        });
-      } else {
-        // Wake word not detected, keep listening quietly
-        stopListening();
-        
-      }
-    }
-  }
-
-  /// Handle command recognition result
   void _handleCommandResult(result) {
-    _recognizedText = result.recognizedWords.toLowerCase();
+    _recognizedText =
+        result.recognizedWords.toLowerCase();
+
+    print(
+      'Recognized command: $_recognizedText',
+    );
 
     if (result.finalResult) {
-      // Parse the command
-      final parsedCommand = _parseCommand(_recognizedText);
+      final parsedCommand =
+          _parseCommand(_recognizedText);
 
       if (parsedCommand != null) {
         _onResult?.call(_recognizedText);
       } else {
-        _handleError('Could not understand command');
+        _handleError(
+          'Could not understand command',
+        );
       }
+
       _isListening = false;
-    _onListeningStateChange?.call(false);
-      
+
+      _onListeningStateChange?.call(false);
+
+      // Return to wake-word mode after command.
+      Future.delayed(
+        const Duration(milliseconds: 500),
+        () {
+          startQuietListeningForWakeWord();
+        },
+      );
     }
   }
 
-  /// Detect if wake word is present in recognized text
-  bool _isWakeWordDetected(String text) {
-    // Wake word: "Hey Sahayta"
-    return text.contains('hey sahayta') ||
-        text.contains('hey sahayata') ||
-        text.contains('hi sahayta') ||
-        text.contains('hello sahayta');
-  }
+  // ============================================================
+  // COMMAND PARSER
+  // ============================================================
 
-  /// Parse command and extract data
-  /// Returns null if unable to parse
   Map<String, String>? _parseCommand(String text) {
     try {
-      // Login pattern: "login using username xyz password abc"
+      // ----------------------------------------------------------
+      // Login
+      // ----------------------------------------------------------
+
       if (_isLoginCommand(text)) {
-        final credentials = _extractLoginCredentials(text);
+        final credentials =
+            _extractLoginCredentials(text);
+
         if (credentials != null) {
           return credentials;
         }
       }
 
-      // Search pattern: "search for video xyz"
+      // ----------------------------------------------------------
+      // Search
+      // ----------------------------------------------------------
+
       if (_isSearchCommand(text)) {
-        return {'command': 'search', 'query': _extractSearchQuery(text)};
+        return {
+          'command': 'search',
+          'query': _extractSearchQuery(text),
+        };
       }
 
-      // Convert pattern: "convert my last video to 4k"
+      // ----------------------------------------------------------
+      // Convert
+      // ----------------------------------------------------------
+
       if (_isConvertCommand(text)) {
-        return {'command': 'convert', 'target': _extractConvertTarget(text)};
+        return {
+          'command': 'convert',
+          'target': _extractConvertTarget(text),
+        };
       }
 
       return null;
     } catch (e) {
-      _handleError('Command parsing error: $e');
+      _handleError(
+        'Command parsing error: $e',
+      );
+
       return null;
     }
   }
 
-  /// Check if text contains login command
-  bool _isLoginCommand(String text) {
-  return text.contains('login') ||
-      text.contains('sign in') ||
-      text.contains('log in') ||
-      (text.contains('username') && text.contains('password'));
-}
+  // ============================================================
+  // LOGIN COMMAND
+  // ============================================================
 
-  /// Extract login credentials from text
-  /// Pattern: "login using username demo password pass123"
-  Map<String, String>? _extractLoginCredentials(String text) {
+  bool _isLoginCommand(String text) {
+    return text.contains('login') ||
+        text.contains('sign in') ||
+        text.contains('log in') ||
+        (text.contains('username') &&
+            text.contains('password'));
+  }
+
+  Map<String, String>? _extractLoginCredentials(
+    String text,
+  ) {
     try {
-      // Simple extraction - looking for keywords
       String username = '';
       String password = '';
 
-      // Find username after "username" keyword
       if (text.contains('username')) {
         final parts = text.split('username');
+
         if (parts.length > 1) {
-          final afterUsername = parts[1].trim();
-          // Get first word after username
-          username = afterUsername.split(' ').first;
+          final afterUsername =
+              parts[1].trim();
+
+          username =
+              afterUsername.split(' ').first;
         }
       }
 
-      // Find password after "password" keyword
       if (text.contains('password')) {
         final parts = text.split('password');
+
         if (parts.length > 1) {
-          final afterPassword = parts[1].trim();
-          // Get first word after password
-          password = afterPassword.split(' ').first;
+          final afterPassword =
+              parts[1].trim();
+
+          password =
+              afterPassword.split(' ').first;
         }
       }
 
-      if (username.isNotEmpty && password.isNotEmpty) {
+      if (username.isNotEmpty &&
+          password.isNotEmpty) {
         return {
           'command': 'login',
           'username': username,
@@ -300,69 +620,106 @@ class VoiceManager {
     }
   }
 
-  /// Check if text contains search command
+  // ============================================================
+  // SEARCH COMMAND
+  // ============================================================
+
   bool _isSearchCommand(String text) {
     return text.contains('search') ||
         text.contains('find') ||
         text.contains('look for');
   }
 
-  /// Extract search query
   String _extractSearchQuery(String text) {
     try {
       if (text.contains('search for')) {
-        return text.split('search for').last.trim();
-      } else if (text.contains('find')) {
-        return text.split('find').last.trim();
+        return text
+            .split('search for')
+            .last
+            .trim();
       }
+
+      if (text.contains('find')) {
+        return text
+            .split('find')
+            .last
+            .trim();
+      }
+
       return text;
     } catch (e) {
       return text;
     }
   }
 
-  /// Check if text contains convert command
+  // ============================================================
+  // CONVERT COMMAND
+  // ============================================================
+
   bool _isConvertCommand(String text) {
-    return text.contains('convert') && (text.contains('4k') || text.contains('hd'));
+    return text.contains('convert') &&
+        (text.contains('4k') ||
+            text.contains('hd'));
   }
 
-  /// Extract convert target
   String _extractConvertTarget(String text) {
     try {
-      if (text.contains('4k')) return '4k';
-      if (text.contains('hd')) return 'hd';
-      return '4k'; // default
+      if (text.contains('4k')) {
+        return '4k';
+      }
+
+      if (text.contains('hd')) {
+        return 'hd';
+      }
+
+      return '4k';
     } catch (e) {
       return '4k';
     }
   }
 
-  /// Handle speech-to-text errors
+  // ============================================================
+  // ERRORS
+  // ============================================================
+
   void _handleError(String error) {
+    print('VoiceManager error: $error');
     _onError?.call(error);
   }
 
-  /// Handle speech-to-text status changes
+  // ============================================================
+  // SPEECH STATUS
+  // ============================================================
+
   void _handleStatus(String status) {
-    // Handle status if needed (e.g., "listening", "notListening")
+    print('Speech status: $status');
   }
 
-  /// Speak text using TTS
-  Future<void> speak(String text) async {
-    try {
-      await _flutterTts.speak(text);
-    } catch (e) {
-      _handleError('TTS error: $e');
-    }
-  }
+  // ============================================================
+  // DISPOSE
+  // ============================================================
 
-  /// Dispose resources
   Future<void> dispose() async {
     try {
       await _speechToText.stop();
+
+      await _stopWakeWordEngine();
+
       await _flutterTts.stop();
+
+      _audioRecorder.dispose();
+
+      if (_wakeWordInitialized) {
+        OpenWakeWord.destroy();
+        _wakeWordInitialized = false;
+      }
+
+      _isListening = false;
+      _isInitialized = false;
     } catch (e) {
-      _handleError('Dispose error: $e');
+      _handleError(
+        'Dispose error: $e',
+      );
     }
   }
 }
